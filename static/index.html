@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Drawing Reviewer</title>
+<link rel="stylesheet" href="css/style.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body>
+<div class="loading-bar" id="loadingBar"></div>
+<header>
+  <div class="logo">&#9881; Drawing Reviewer</div>
+  <div class="header-actions">
+    <label class="btn btn-primary" for="fileInput">&#128194; Open PDF</label>
+    <input type="file" id="fileInput" accept=".pdf" hidden/>
+    <button class="btn btn-secondary" id="analyseBtn" disabled>&#128269; Analyse</button>
+    <button class="btn btn-success" id="exportBtn" disabled>&#128190; Export Reviewed PDF</button>
+  </div>
+</header>
+<div class="workspace">
+  <div class="viewer-panel">
+    <div class="viewer-toolbar">
+      <button id="prevPage">&#9664;</button>
+      <span id="pageInfo">No file loaded</span>
+      <button id="nextPage">&#9654;</button>
+      <span style="margin-left:10px;color:#90a4ae" id="fileName"></span>
+    </div>
+    <div id="canvasWrapper">
+      <canvas id="pdfCanvas"></canvas>
+      <canvas id="overlayCanvas"></canvas>
+    </div>
+  </div>
+  <div class="review-panel">
+    <div class="review-header">
+      <h3>&#128203; Review Findings</h3>
+      <div class="review-filters">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="open">Open</button>
+        <button class="filter-btn" data-filter="keep">Keep</button>
+        <button class="filter-btn" data-filter="trash">Trash</button>
+        <button class="filter-btn" data-filter="think">Think</button>
+      </div>
+    </div>
+    <div class="review-list" id="reviewList">
+      <div class="empty-state">
+        <div class="icon">&#128196;</div>
+        <p>Open a PDF drawing and click Analyse to see findings here.</p>
+      </div>
+    </div>
+    <div class="review-footer">
+      <div class="stats" id="stats"></div>
+      <button class="btn btn-success" id="exportBtn2" disabled style="width:100%">&#128190; Export Reviewed PDF</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const PDFJS = pdfjsLib;
+PDFJS.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+let pdfDoc=null, currentPage=1, totalPages=0, pdfBytes=null, findings=[], currentFilter='all';
+const SEV_COLOR={high:'#ef5350',medium:'#ff9800',low:'#42a5f5'};
+const canvas=document.getElementById('pdfCanvas');
+const overlay=document.getElementById('overlayCanvas');
+const ctx=canvas.getContext('2d');
+const octx=overlay.getContext('2d');
+
+document.getElementById('fileInput').addEventListener('change',async e=>{
+  const file=e.target.files[0]; if(!file) return;
+  document.getElementById('fileName').textContent=file.name;
+  const ab=await file.arrayBuffer();
+  pdfBytes=new Uint8Array(ab);
+  pdfDoc=await PDFJS.getDocument({data:pdfBytes}).promise;
+  totalPages=pdfDoc.numPages; currentPage=1;
+  await renderPage(currentPage);
+  document.getElementById('analyseBtn').disabled=false;
+  updatePageInfo();
+  showToast('PDF loaded: '+file.name);
+});
+
+async function renderPage(n){
+  const page=await pdfDoc.getPage(n);
+  const vp=page.getViewport({scale:1.5});
+  canvas.width=vp.width; canvas.height=vp.height;
+  overlay.width=vp.width; overlay.height=vp.height;
+  overlay.style.width=vp.width+'px'; overlay.style.height=vp.height+'px';
+  await page.render({canvasContext:ctx,viewport:vp}).promise;
+  drawOverlay();
+}
+
+function drawOverlay(){
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  const pageFindingsArr=findings.filter(f=>f.page===currentPage&&f.status!=='trash');
+  pageFindingsArr.forEach((f,i)=>{
+    const y=30+i*44;
+    const col=SEV_COLOR[f.severity]||'#aaa';
+    octx.fillStyle=col+'33';
+    octx.strokeStyle=col;
+    octx.lineWidth=2;
+    octx.beginPath();
+    octx.roundRect(10,y,overlay.width-20,38,6);
+    octx.fill(); octx.stroke();
+    octx.fillStyle='#fff';
+    octx.font='bold 11px Segoe UI';
+    octx.fillText('['+f.id+'] '+f.type.replace(/_/g,' ').toUpperCase(),18,y+14);
+    octx.font='10px Segoe UI';
+    octx.fillStyle='#e0e0e0';
+    octx.fillText((f.suggested||'').substring(0,80),18,y+28);
+  });
+}
+
+document.getElementById('prevPage').addEventListener('click',async()=>{
+  if(currentPage>1){currentPage--;await renderPage(currentPage);updatePageInfo();}
+});
+document.getElementById('nextPage').addEventListener('click',async()=>{
+  if(currentPage<totalPages){currentPage++;await renderPage(currentPage);updatePageInfo();}
+});
+
+function updatePageInfo(){
+  document.getElementById('pageInfo').textContent='Page '+currentPage+' / '+totalPages;
+}
+
+document.getElementById('analyseBtn').addEventListener('click',async()=>{
+  if(!pdfBytes) return;
+  setLoading(true);
+  showToast('Analysing drawing...');
+  try{
+    const b64=btoa(String.fromCharCode(...pdfBytes));
+    const res=await fetch('/analyse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pdf:b64})});
+    const data=await res.json();
+    if(data.error){showToast('Error: '+data.error);return;}
+    findings=data.findings;
+    renderFindings();
+    drawOverlay();
+    document.getElementById('exportBtn').disabled=false;
+    document.getElementById('exportBtn2').disabled=false;
+    showToast(findings.length+' findings detected');
+  }catch(e){showToast('Server error: '+e.message);}
+  finally{setLoading(false);}
+});
+
+function renderFindings(){
+  const list=document.getElementById('reviewList');
+  const filtered=currentFilter==='all'?findings:findings.filter(f=>f.status===currentFilter);
+  if(!filtered.length){list.innerHTML='<div class="empty-state"><div class="icon">&#10003;</div><p>No findings for this filter.</p></div>';updateStats();return;}
+  list.innerHTML=filtered.map(f=>cardHTML(f)).join('');
+  filtered.forEach(f=>{
+    document.getElementById('card-'+f.id).querySelector('.card-header').addEventListener('click',()=>toggleCard(f.id));
+    document.getElementById('card-'+f.id).querySelectorAll('.action-btn').forEach(btn=>{
+      btn.addEventListener('click',e=>{e.stopPropagation();setStatus(f.id,btn.dataset.status);});
+    });
+    document.getElementById('sug-'+f.id).addEventListener('input',e=>{const fi=findings.find(x=>x.id===f.id);if(fi)fi.suggested=e.target.value;});
+  });
+  updateStats();
+}
+
+function cardHTML(f){
+  return '<div class="finding-card status-'+f.status+'" id="card-'+f.id+'">'+'<div class="card-header">'+'<span class="sev-badge sev-'+f.severity+'">'+f.severity+'</span>'+'<span class="card-title">'+f.type.replace(/_/g,' ')+'</span>'+'<span class="card-id">'+f.id+'</span>'+'</div>'+'<div class="card-body" id="body-'+f.id+'">'+'<div class="card-row"><div class="card-label">Region</div><div class="card-value">'+f.region+'</div></div>'+'<div class="card-row"><div class="card-label">Current Value</div><div class="card-value">'+f.current+'</div></div>'+'<div class="card-row"><div class="card-label">Suggested Change</div><textarea class="card-edit" id="sug-'+f.id+'">'+f.suggested+'</textarea></div>'+'<div class="card-row"><div class="card-label">Reason</div><div class="card-value">'+f.reason+'</div></div>'+'<div class="card-actions">'+'<button class="action-btn keep" data-status="keep">&#10003; Keep</button>'+'<button class="action-btn trash" data-status="trash">&#10007; Trash</button>'+'<button class="action-btn think" data-status="think">&#63; Think</button>'+'<button class="action-btn open" data-status="open">&#8635; Reset</button>'+'</div>'+'</div>'+'</div>';
+}
+
+function toggleCard(id){
+  const body=document.getElementById('body-'+id);
+  body.classList.toggle('open');
+}
+
+function setStatus(id,status){
+  const f=findings.find(x=>x.id===id);
+  if(f){f.status=status;renderFindings();drawOverlay();showToast('['+id+'] marked as '+status);}
+}
+
+document.querySelectorAll('.filter-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFilter=btn.dataset.filter;
+    renderFindings();
+  });
+});
+
+async function doExport(){
+  if(!pdfBytes||!findings.length) return;
+  const approved=findings.filter(f=>f.status==='keep');
+  if(!approved.length){showToast('No findings marked as Keep to export.');return;}
+  setLoading(true);
+  showToast('Generating reviewed PDF...');
+  try{
+    const b64=btoa(String.fromCharCode(...pdfBytes));
+    const res=await fetch('/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pdf:b64,approved})});
+    const data=await res.json();
+    if(data.error){showToast('Export error: '+data.error);return;}
+    const bin=atob(data.pdf);
+    const bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    const blob=new Blob([bytes],{type:'application/pdf'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='reviewed_drawing.pdf'; a.click();
+    URL.revokeObjectURL(url);
+    showToast('Reviewed PDF downloaded!');
+  }catch(e){showToast('Export failed: '+e.message);}
+  finally{setLoading(false);}
+}
+
+document.getElementById('exportBtn').addEventListener('click',doExport);
+document.getElementById('exportBtn2').addEventListener('click',doExport);
+
+function updateStats(){
+  const el=document.getElementById('stats');
+  const keep=findings.filter(f=>f.status==='keep').length;
+  const trash=findings.filter(f=>f.status==='trash').length;
+  const think=findings.filter(f=>f.status==='think').length;
+  const open=findings.filter(f=>f.status==='open').length;
+  el.innerHTML='<span class="stat"><span class="stat-dot" style="background:#2e7d32"></span>Keep: '+keep+'</span>'+'<span class="stat"><span class="stat-dot" style="background:#b71c1c"></span>Trash: '+trash+'</span>'+'<span class="stat"><span class="stat-dot" style="background:#e65100"></span>Think: '+think+'</span>'+'<span class="stat"><span class="stat-dot" style="background:#37474f"></span>Open: '+open+'</span>';
+}
+
+function setLoading(on){
+  document.getElementById('loadingBar').style.display=on?'block':'none';
+}
+
+function showToast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),3000);
+}
+</script>
+</body>
+</html>
